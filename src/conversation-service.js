@@ -329,6 +329,30 @@ function extractContextFromMetadata(metadata) {
   return '';
 }
 
+async function getChunkTextFromFirestore(userId, campaignId, fileName, chunkIndex) {
+  if (!fileName || chunkIndex === undefined || chunkIndex === null) return '';
+  const db = getDb();
+  try {
+    const chunksSnap = await db
+      .collection('users')
+      .doc(userId)
+      .collection('campaigns')
+      .doc(campaignId)
+      .collection('chunks')
+      .where('docName', '==', fileName)
+      .where('index', '==', Number(chunkIndex))
+      .get();
+
+    if (!chunksSnap.empty) {
+      const data = chunksSnap.docs[0].data();
+      return data.chunkText || '';
+    }
+  } catch (error) {
+    console.warn(`[Conv-Service] ⚠️ Failed to fetch chunk from Firestore:`, error.message);
+  }
+  return '';
+}
+
 async function retrieveRagContext(userId, campaignId, question) {
   const namespace = await loadPineconeNamespace(userId, campaignId);
   const index = getPineconeIndex();
@@ -347,14 +371,39 @@ async function retrieveRagContext(userId, campaignId, question) {
 
   const matches = results.matches || [];
   console.log(`[Conv-Service]    📊 Pinecone results: ${matches.length} total matches`);
+  console.log(`[Conv-Service]    🔍 Resolving match texts from Firestore chunks collection...`);
+
+  // Fetch all chunk contents from Firestore in parallel
+  const matchesWithContent = await Promise.all(
+    matches.map(async (match, idx) => {
+      const metadata = match.metadata || {};
+      let content = extractContextFromMetadata(metadata);
+      
+      // Fallback to Firestore if Pinecone metadata doesn't contain the text content
+      if (!content && metadata.fileName && metadata.chunkIndex !== undefined) {
+        content = await getChunkTextFromFirestore(
+          userId,
+          campaignId,
+          metadata.fileName,
+          metadata.chunkIndex
+        );
+      }
+      
+      return {
+        ...match,
+        content: content || '',
+      };
+    })
+  );
+
   console.log(`[Conv-Service]    📋 All Matches:\n`);
   
   // Log all matches with scores
-  matches.forEach((match, idx) => {
+  matchesWithContent.forEach((match, idx) => {
     const score = (match.score ?? 0).toFixed(3);
     const chunkId = match.id || `chunk_${idx}`;
     const metadata = match.metadata || {};
-    const preview = extractContextFromMetadata(metadata).substring(0, 80);
+    const preview = match.content.substring(0, 80);
     const metaKeys = Object.keys(metadata).join(', ');
     
     console.log(`[Conv-Service]       [${idx + 1}] Chunk ID: ${chunkId}`);
@@ -365,7 +414,7 @@ async function retrieveRagContext(userId, campaignId, question) {
   });
 
   const RELEVANCE_THRESHOLD = 0.2;
-  const relevant = matches.filter((match) => (match.score ?? 0) >= RELEVANCE_THRESHOLD);
+  const relevant = matchesWithContent.filter((match) => (match.score ?? 0) >= RELEVANCE_THRESHOLD);
   
   console.log(`[Conv-Service]    ✅ Filtering by threshold (${RELEVANCE_THRESHOLD}): ${relevant.length}/${matches.length} passed`);
   console.log(`[Conv-Service]    📌 Selected Chunks:\n`);
@@ -374,7 +423,7 @@ async function retrieveRagContext(userId, campaignId, question) {
     .map((match, idx) => {
       const chunkId = match.id || `chunk_${idx}`;
       const score = (match.score ?? 0).toFixed(3);
-      const content = extractContextFromMetadata(match.metadata);
+      const content = match.content;
       
       console.log(`[Conv-Service]       Chunk ${idx + 1}/${relevant.length}: ${chunkId}`);
       console.log(`[Conv-Service]           Score: ${score}`);
@@ -399,7 +448,7 @@ async function retrieveRagContext(userId, campaignId, question) {
     chunkDetails: relevant.map((match, idx) => ({
       chunkId: match.id || `chunk_${idx}`,
       score: (match.score ?? 0).toFixed(3),
-      content: extractContextFromMetadata(match.metadata),
+      content: match.content,
     })),
   };
 }
