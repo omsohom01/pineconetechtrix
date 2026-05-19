@@ -3,18 +3,13 @@ const axios = require('axios');
 const fs = require('fs/promises');
 const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
-const wav = require('wav');
-const { PassThrough } = require('stream');
-const { GoogleGenAI } = require('@google/genai');
+const ffmpeg = require('fluent-ffmpeg');
+const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { v2: cloudinary } = require('cloudinary');
 const router = express.Router();
 
-let ffmpegStaticPath = null;
-try {
-  ffmpegStaticPath = require('ffmpeg-static');
-} catch (err) {
-  ffmpegStaticPath = null;
-}
+ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 const {
   handleWhatsAppMessage,
   findLatestCampaignByPhone,
@@ -248,93 +243,103 @@ function getGeminiApiKey() {
   return process.env.GEMINI_WHATSAPP_API_KEY || process.env.GEMINI_API_KEY || '';
 }
 
-function getFfmpegPath() {
-  return process.env.FFMPEG_PATH || ffmpegStaticPath || 'ffmpeg';
+function getGeminiTtsApiKey() {
+  return process.env.GEMINI_TTS_API_KEY || getGeminiApiKey();
 }
 
-function runFfmpeg(args) {
-  return new Promise((resolve, reject) => {
-    const ffmpegPath = getFfmpegPath();
-    const proc = spawn(ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
-    let stderr = '';
+let cloudinaryConfigured = false;
+function ensureCloudinaryConfigured() {
+  if (cloudinaryConfigured) return;
 
-    proc.stderr.on('data', (chunk) => {
-      stderr += chunk.toString();
-    });
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME || '';
+  const apiKey = process.env.CLOUDINARY_API_KEY || '';
+  const apiSecret = process.env.CLOUDINARY_API_SECRET || '';
 
-    proc.on('error', (err) => {
-      reject(new Error(`ffmpeg failed to start: ${err.message}`));
-    });
+  if (!cloudName || !apiKey || !apiSecret) {
+    throw new Error('Missing Cloudinary credentials for voice note uploads');
+  }
 
-    proc.on('close', (code) => {
-      if (code === 0) return resolve();
-      reject(new Error(`ffmpeg exited with code ${code}: ${stderr}`));
-    });
+  cloudinary.config({
+    cloud_name: cloudName,
+    api_key: apiKey,
+    api_secret: apiSecret,
   });
+  cloudinaryConfigured = true;
 }
 
-function isWavBuffer(buffer) {
-  if (!buffer || buffer.length < 12) return false;
-  return (
-    buffer.toString('ascii', 0, 4) === 'RIFF' &&
-    buffer.toString('ascii', 8, 12) === 'WAVE'
-  );
-}
+function buildWavBufferFromPcm(pcmBuffer, options = {}) {
+  const { sampleRate = 24000, numChannels = 1, bitsPerSample = 16 } = options;
+  const byteRate = (sampleRate * numChannels * bitsPerSample) / 8;
+  const blockAlign = (numChannels * bitsPerSample) / 8;
 
-function pcmToWavBuffer(pcmBuffer, options = {}) {
-  const { channels = 1, sampleRate = 24000, bitDepth = 16 } = options;
+  const wavHeader = Buffer.alloc(44);
+  wavHeader.write('RIFF', 0);
+  wavHeader.writeUInt32LE(pcmBuffer.length + 36, 4);
+  wavHeader.write('WAVE', 8);
+  wavHeader.write('fmt ', 12);
+  wavHeader.writeUInt32LE(16, 16);
+  wavHeader.writeUInt16LE(1, 20);
+  wavHeader.writeUInt16LE(numChannels, 22);
+  wavHeader.writeUInt32LE(sampleRate, 24);
+  wavHeader.writeUInt32LE(byteRate, 28);
+  wavHeader.writeUInt16LE(blockAlign, 32);
+  wavHeader.writeUInt16LE(bitsPerSample, 34);
+  wavHeader.write('data', 36);
+  wavHeader.writeUInt32LE(pcmBuffer.length, 40);
 
-  return new Promise((resolve, reject) => {
-    const writer = new wav.Writer({
-      channels,
-      sampleRate,
-      bitDepth,
-    });
-
-    const passthrough = new PassThrough();
-    const chunks = [];
-
-    passthrough.on('data', (chunk) => chunks.push(chunk));
-    passthrough.on('end', () => resolve(Buffer.concat(chunks)));
-    passthrough.on('error', reject);
-    writer.on('error', reject);
-
-    writer.pipe(passthrough);
-    writer.write(pcmBuffer);
-    writer.end();
-  });
+  return Buffer.concat([wavHeader, pcmBuffer]);
 }
 
 async function convertWavToOggOpus(wavBuffer) {
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'wa-tts-'));
-  const inputPath = path.join(tmpDir, 'input.wav');
-  const outputPath = path.join(tmpDir, 'output.ogg');
+  const tempDir = os.tmpdir();
+  const tempBase = `tts_${Date.now()}`;
+  const wavPath = path.join(tempDir, `${tempBase}.wav`);
+  const oggPath = path.join(tempDir, `${tempBase}.ogg`);
 
   try {
-    await fs.writeFile(inputPath, wavBuffer);
-    await runFfmpeg(['-y', '-i', inputPath, '-c:a', 'libopus', '-b:a', '24k', outputPath]);
-    return await fs.readFile(outputPath);
+    await fs.writeFile(wavPath, wavBuffer);
+
+    await new Promise((resolve, reject) => {
+      ffmpeg(wavPath)
+        .audioCodec('libopus')
+        .audioFrequency(24000)
+        .audioChannels(1)
+        .audioBitrate('24k')
+        .format('ogg')
+        .on('start', (cmd) => console.log(`[TTS] 🎛️  ffmpeg: ${cmd}`))
+        .on('end', resolve)
+        .on('error', (err) => reject(new Error(`ffmpeg conversion failed: ${err.message}`)))
+        .save(oggPath);
+    });
+
+    return await fs.readFile(oggPath);
   } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await Promise.all([
+      fs.rm(wavPath, { force: true }),
+      fs.rm(oggPath, { force: true }),
+    ]);
   }
 }
 
-async function ensureOggOpus(audioBuffer, mimeType) {
-  if (mimeType && mimeType.includes('ogg')) {
-    return { audioBuffer, mimeType: 'audio/ogg' };
-  }
+async function uploadOggToCloudinary(oggBuffer, publicId) {
+  ensureCloudinaryConfigured();
 
-  if (mimeType && mimeType.includes('wav')) {
-    const oggBuffer = await convertWavToOggOpus(audioBuffer);
-    return { audioBuffer: oggBuffer, mimeType: 'audio/ogg' };
-  }
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        resource_type: 'raw',
+        public_id: publicId,
+        format: 'ogg',
+      },
+      (error, result) => {
+        if (error) return reject(error);
+        if (!result) return reject(new Error('Cloudinary upload failed'));
+        resolve(result);
+      }
+    );
 
-  if (isWavBuffer(audioBuffer)) {
-    const oggBuffer = await convertWavToOggOpus(audioBuffer);
-    return { audioBuffer: oggBuffer, mimeType: 'audio/ogg' };
-  }
-
-  throw new Error('Unsupported TTS output format for WhatsApp voice note');
+    stream.end(oggBuffer);
+  });
 }
 
 async function fetchWhatsAppMediaInfo(mediaId) {
@@ -399,82 +404,94 @@ async function transcribeAudioWithGemini(audioBuffer, mimeType) {
   return transcript;
 }
 
-async function synthesizeSpeechWithGemini(text) {
-  const apiKey = getGeminiApiKey();
+async function synthesizeSpeechWithGemini(text, options = {}) {
+  const apiKey = getGeminiTtsApiKey();
   if (!apiKey) throw new Error('Missing GEMINI api key for TTS');
 
-  const ttsVoice = process.env.GEMINI_TTS_VOICE || 'Kore';
-  const ai = new GoogleGenAI({ apiKey });
+  const voiceName = options.voiceName || process.env.GEMINI_TTS_VOICE || 'Kore';
+  const ttsModel = process.env.GEMINI_TTS_MODEL || 'gemini-3.1-flash-tts-preview';
+  console.log(`[TTS] 🧠 Generating voice with Gemini (${ttsModel}, ${voiceName})...`);
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-2.5-flash-preview-tts',
-    contents: [{ parts: [{ text }] }],
-    config: {
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({ model: ttsModel }, { apiVersion: 'v1beta' });
+
+  const response = await model.generateContent({
+    contents: [{ role: 'user', parts: [{ text }] }],
+    generationConfig: {
       responseModalities: ['AUDIO'],
       speechConfig: {
         voiceConfig: {
-          prebuiltVoiceConfig: { voiceName: ttsVoice },
+          prebuiltVoiceConfig: { voiceName },
         },
       },
     },
   });
 
-  const audioBase64 = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+  const audioPart = response.response?.candidates?.[0]?.content?.parts?.find(
+    (part) => part.inlineData?.mimeType?.startsWith('audio/')
+  );
+  const audioBase64 = audioPart?.inlineData?.data;
+
   if (!audioBase64) {
-    console.error('[TTS] No audio in response:', JSON.stringify(response.candidates, null, 2));
+    console.error('[TTS] No audio in response:', JSON.stringify(response.response?.candidates, null, 2));
     throw new Error('No audio data returned from TTS');
   }
 
-  const inlineMime = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.mimeType || '';
-  let audioBuffer = Buffer.from(audioBase64, 'base64');
-  let mimeType = inlineMime;
-
-  if (!mimeType && !isWavBuffer(audioBuffer)) {
-    audioBuffer = await pcmToWavBuffer(audioBuffer);
-    mimeType = 'audio/wav';
-  } else if (!mimeType && isWavBuffer(audioBuffer)) {
-    mimeType = 'audio/wav';
-  }
-
-  console.log(`[TTS] ✅ Audio generated, mimeType: ${mimeType}, size: ${audioBuffer.length} bytes`);
-  return { audioBuffer, mimeType };
+  const audioBuffer = Buffer.from(audioBase64, 'base64');
+  console.log(`[TTS] ✅ PCM audio received (${audioBuffer.length} bytes)`);
+  return audioBuffer;
 }
 
-async function uploadAudioToWhatsApp(audioBuffer, mimeType) {
-  if (typeof FormData === 'undefined' || typeof Blob === 'undefined') {
-    throw new Error('FormData/Blob not available in this Node version');
+async function generateVoiceNoteAudioUrl(text, options = {}) {
+  const voiceName = options.voiceName || process.env.GEMINI_TTS_VOICE || 'Kore';
+  const publicIdPrefix =
+    options.publicIdPrefix ||
+    process.env.WHATSAPP_VOICE_PUBLIC_ID_PREFIX ||
+    'outreachx-whatsapp/voice-notes';
+
+  const pcmBuffer = await synthesizeSpeechWithGemini(text, { voiceName });
+
+  console.log('[TTS] 🎛️  Building WAV container (PCM -> WAV)...');
+  const wavBuffer = buildWavBufferFromPcm(pcmBuffer);
+  console.log(`[TTS] ✅ WAV buffer ready (${wavBuffer.length} bytes)`);
+
+  console.log('[TTS] 🎚️  Converting WAV to OGG/OPUS...');
+  const oggBuffer = await convertWavToOggOpus(wavBuffer);
+  console.log(`[TTS] ✅ OGG/OPUS ready (${oggBuffer.length} bytes)`);
+
+  const publicId = `${publicIdPrefix}/${Date.now()}_${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
+  console.log(`[TTS] ☁️  Uploading to Cloudinary (${publicId})...`);
+  const uploadResult = await uploadOggToCloudinary(oggBuffer, publicId);
+
+  let audioUrl = uploadResult?.secure_url || uploadResult?.url || '';
+  if (!audioUrl) throw new Error('Cloudinary upload returned no URL');
+
+  if (!audioUrl.includes('f_ogg')) {
+    audioUrl = audioUrl.replace('/upload/', '/upload/f_ogg/');
   }
 
-  const mediaUrl = `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/media`;
-  const formData = new FormData();
-  const audioType = mimeType || 'audio/ogg';
-
-  formData.append('messaging_product', 'whatsapp');
-  formData.append('type', audioType);
-  formData.append('file', new Blob([audioBuffer], { type: audioType }), 'reply.ogg');
-
-  const res = await fetch(mediaUrl, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${ACCESS_TOKEN}`,
-    },
-    body: formData,
-  });
-
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data?.error?.message || 'Failed to upload audio to WhatsApp');
+  try {
+    const headRes = await fetch(audioUrl, { method: 'HEAD' });
+    if (!headRes.ok) {
+      console.warn(`[TTS] ⚠️  Audio HEAD check failed (${headRes.status})`);
+    }
+  } catch (err) {
+    console.warn(`[TTS] ⚠️  Audio HEAD check error: ${err.message}`);
   }
 
-  return data.id;
+  console.log(`[TTS] ✅ Audio URL ready: ${audioUrl}`);
+  return audioUrl;
 }
 
 async function sendVoiceNoteFromText(to, text) {
-  const tts = await synthesizeSpeechWithGemini(text);
-  const oggAudio = await ensureOggOpus(tts.audioBuffer, tts.mimeType);
-  const mediaId = await uploadAudioToWhatsApp(oggAudio.audioBuffer, oggAudio.mimeType);
-  await sendAudioById(to, mediaId);
-  return mediaId;
+  const audioUrl = await generateVoiceNoteAudioUrl(text, {
+    publicIdPrefix: `outreachx-whatsapp/voice-notes/${to}`,
+  });
+  const sendRes = await sendAudio(to, audioUrl);
+  const messageId = sendRes?.messages?.[0]?.id || null;
+  return { messageId, audioUrl };
 }
 
 /**
@@ -1208,11 +1225,14 @@ async function handleVoiceNoteConversation({ from, messageId, mediaId }) {
 
   const aiReply = await generateCampaignReply(userId, campaignId, contactId, transcript);
 
-  let replyMediaId = null;
+  let replyMessageId = null;
+  let replyAudioUrl = null;
   let replyType = 'audio';
 
   try {
-    replyMediaId = await sendVoiceNoteFromText(normalizedPhone, aiReply);
+    const voiceSend = await sendVoiceNoteFromText(normalizedPhone, aiReply);
+    replyMessageId = voiceSend.messageId;
+    replyAudioUrl = voiceSend.audioUrl;
   } catch (sendErr) {
     replyType = 'text';
     console.error(`  ❌ Voice reply failed, falling back to text:`, sendErr.message);
@@ -1237,7 +1257,8 @@ async function handleVoiceNoteConversation({ from, messageId, mediaId }) {
         whatsappMessageId: messageId,
       },
       aiMeta: {
-        audioMediaId: replyMediaId,
+        whatsappMessageId: replyMessageId,
+        audioUrl: replyAudioUrl,
       },
     }
   );
