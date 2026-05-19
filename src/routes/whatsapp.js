@@ -302,7 +302,40 @@ async function synthesizeSpeechWithGemini(text) {
     throw new Error('Missing GEMINI api key for TTS');
   }
 
-  const body = {
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-tts-preview:generateContent?key=${apiKey}`;
+
+  const invokeTts = async (body, label) => {
+    try {
+      const res = await axios.post(endpoint, body, {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 30000,
+      });
+
+      const parts = res.data?.candidates?.[0]?.content?.parts || [];
+      const audioPart = parts.find((part) => part.inlineData?.data);
+      const audioBase64 = audioPart?.inlineData?.data || '';
+      const mimeType = audioPart?.inlineData?.mimeType || 'audio/ogg';
+
+      if (!audioBase64) {
+        throw new Error('No audio data returned from TTS');
+      }
+
+      return {
+        audioBuffer: Buffer.from(audioBase64, 'base64'),
+        mimeType,
+      };
+    } catch (err) {
+      const status = err?.response?.status;
+      const data = err?.response?.data;
+      console.error(`[TTS] ${label} request failed`, {
+        status,
+        error: data?.error || data,
+      });
+      throw err;
+    }
+  };
+
+  const primaryBody = {
     contents: [
       {
         role: 'user',
@@ -317,25 +350,27 @@ async function synthesizeSpeechWithGemini(text) {
     },
   };
 
-  const res = await axios.post(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-tts-preview:generateContent?key=${apiKey}`,
-    body,
-    { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
-  );
+  try {
+    return await invokeTts(primaryBody, 'primary');
+  } catch (err) {
+    if (err?.response?.status !== 400) {
+      throw err;
+    }
 
-  const parts = res.data?.candidates?.[0]?.content?.parts || [];
-  const audioPart = parts.find((part) => part.inlineData?.data);
-  const audioBase64 = audioPart?.inlineData?.data || '';
-  const mimeType = audioPart?.inlineData?.mimeType || 'audio/ogg';
+    const fallbackBody = {
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text }],
+        },
+      ],
+      generationConfig: {
+        responseModalities: ['AUDIO'],
+      },
+    };
 
-  if (!audioBase64) {
-    throw new Error('No audio data returned from TTS');
+    return await invokeTts(fallbackBody, 'fallback');
   }
-
-  return {
-    audioBuffer: Buffer.from(audioBase64, 'base64'),
-    mimeType,
-  };
 }
 
 async function uploadAudioToWhatsApp(audioBuffer, mimeType) {
