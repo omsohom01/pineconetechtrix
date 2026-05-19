@@ -6,6 +6,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const wav = require('wav');
 const { PassThrough } = require('stream');
+const { GoogleGenAI } = require('@google/genai');
 const router = express.Router();
 
 let ffmpegStaticPath = null;
@@ -400,98 +401,43 @@ async function transcribeAudioWithGemini(audioBuffer, mimeType) {
 
 async function synthesizeSpeechWithGemini(text) {
   const apiKey = getGeminiApiKey();
-  if (!apiKey) {
-    throw new Error('Missing GEMINI api key for TTS');
-  }
+  if (!apiKey) throw new Error('Missing GEMINI api key for TTS');
 
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-tts-preview:generateContent?key=${apiKey}`;
+  const ttsVoice = process.env.GEMINI_TTS_VOICE || 'Kore';
+  const ai = new GoogleGenAI({ apiKey });
 
-  const invokeTts = async (body, label) => {
-    try {
-      const res = await axios.post(endpoint, body, {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 30000,
-      });
-
-      const parts = res.data?.candidates?.[0]?.content?.parts || [];
-      const audioPart = parts.find((part) => part.inlineData?.data);
-      const audioBase64 = audioPart?.inlineData?.data || '';
-      const inlineMime = audioPart?.inlineData?.mimeType || '';
-
-      if (!audioBase64) {
-        throw new Error('No audio data returned from TTS');
-      }
-
-      let audioBuffer = Buffer.from(audioBase64, 'base64');
-      let mimeType = inlineMime;
-
-      if (!mimeType && !isWavBuffer(audioBuffer)) {
-        audioBuffer = await pcmToWavBuffer(audioBuffer);
-        mimeType = 'audio/wav';
-      } else if (!mimeType && isWavBuffer(audioBuffer)) {
-        mimeType = 'audio/wav';
-      }
-
-      return {
-        audioBuffer,
-        mimeType,
-      };
-    } catch (err) {
-      const status = err?.response?.status;
-      const data = err?.response?.data;
-      console.error(`[TTS] ${label} request failed`, {
-        status,
-        error: data?.error || data,
-        raw: data ? JSON.stringify(data, null, 2) : undefined,
-      });
-      throw err;
-    }
-  };
-
-  const ttsVoice = process.env.GEMINI_TTS_VOICE || '';
-  const baseConfig = {
-  responseModalities: ['AUDIO'],
-};
-
-const voiceConfig = ttsVoice
-  ? {
+  const response = await ai.models.generateContent({
+    model: 'gemini-2.5-flash-preview-tts',
+    contents: [{ parts: [{ text }] }],
+    config: {
+      responseModalities: ['AUDIO'],
       speechConfig: {
         voiceConfig: {
           prebuiltVoiceConfig: { voiceName: ttsVoice },
         },
       },
-    }
-  : {};
-
-const baseBody = {
-  contents: [
-    {
-      role: 'user',
-      parts: [{ text }],
     },
-  ],
-  generationConfig: baseConfig,           // ✅ CORRECT KEY
-};
+  });
 
-const withVoiceBody = ttsVoice
-  ? {
-      contents: baseBody.contents,
-      generationConfig: { ...baseConfig, ...voiceConfig },  // ✅ CORRECT KEY
-    }
-  : null;
-
-  try {
-    if (withVoiceBody) {
-      return await invokeTts(withVoiceBody, 'primary');
-    }
-    return await invokeTts(baseBody, 'primary');
-  } catch (err) {
-    if (err?.response?.status !== 400) {
-      throw err;
-    }
-
-    return await invokeTts(baseBody, 'fallback');
+  const audioBase64 = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+  if (!audioBase64) {
+    console.error('[TTS] No audio in response:', JSON.stringify(response.candidates, null, 2));
+    throw new Error('No audio data returned from TTS');
   }
+
+  const inlineMime = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.mimeType || '';
+  let audioBuffer = Buffer.from(audioBase64, 'base64');
+  let mimeType = inlineMime;
+
+  if (!mimeType && !isWavBuffer(audioBuffer)) {
+    audioBuffer = await pcmToWavBuffer(audioBuffer);
+    mimeType = 'audio/wav';
+  } else if (!mimeType && isWavBuffer(audioBuffer)) {
+    mimeType = 'audio/wav';
+  }
+
+  console.log(`[TTS] ✅ Audio generated, mimeType: ${mimeType}, size: ${audioBuffer.length} bytes`);
+  return { audioBuffer, mimeType };
 }
 
 async function uploadAudioToWhatsApp(audioBuffer, mimeType) {
@@ -1359,7 +1305,7 @@ async function handleIncomingMessage(message, metadata) {
     if (type === 'text' && content.trim()) {
       console.log(`\n  ✅ This is a TEXT MESSAGE - proceeding to conversation handler...`);
       console.log(`  🤖 Calling handleWhatsAppMessage()...`);
-      
+
       try {
         // IMPORTANT: Await here so we wait for the async handler to complete
         await handleWhatsAppMessage(from, content, messageId);
