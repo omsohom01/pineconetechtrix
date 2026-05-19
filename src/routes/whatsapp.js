@@ -1,7 +1,12 @@
 const express = require('express');
 const axios = require('axios');
 const router = express.Router();
-const { handleWhatsAppMessage } = require('../conversation-service');
+const {
+  handleWhatsAppMessage,
+  findLatestCampaignByPhone,
+  generateCampaignReply,
+  saveChatHistory,
+} = require('../conversation-service');
 
 const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
 const ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
@@ -209,6 +214,164 @@ async function sendAudio(to, audioUrl) {
     type: 'audio',
     audio: { link: audioUrl },
   });
+}
+
+/**
+ * Send an audio/voice note by WhatsApp media ID.
+ * This avoids the need for a public URL.
+ */
+async function sendAudioById(to, mediaId) {
+  return sendWA({
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to,
+    type: 'audio',
+    audio: { id: mediaId },
+  });
+}
+
+function getGeminiApiKey() {
+  return process.env.GEMINI_WHATSAPP_API_KEY || process.env.GEMINI_API_KEY || '';
+}
+
+async function fetchWhatsAppMediaInfo(mediaId) {
+  const url = `https://graph.facebook.com/v22.0/${mediaId}`;
+  const res = await axios.get(url, {
+    headers: { Authorization: `Bearer ${ACCESS_TOKEN}` },
+  });
+
+  return {
+    url: res.data?.url,
+    mimeType: res.data?.mime_type,
+    sha256: res.data?.sha256,
+    fileSize: res.data?.file_size,
+  };
+}
+
+async function downloadWhatsAppMedia(mediaUrl) {
+  const res = await axios.get(mediaUrl, {
+    responseType: 'arraybuffer',
+    headers: { Authorization: `Bearer ${ACCESS_TOKEN}` },
+  });
+
+  return Buffer.from(res.data);
+}
+
+async function transcribeAudioWithGemini(audioBuffer, mimeType) {
+  const apiKey = getGeminiApiKey();
+  if (!apiKey) {
+    throw new Error('Missing GEMINI api key for transcription');
+  }
+
+  const body = {
+    contents: [
+      {
+        role: 'user',
+        parts: [
+          { text: 'Transcribe this audio to plain text only.' },
+          {
+            inlineData: {
+              mimeType: mimeType || 'audio/ogg',
+              data: audioBuffer.toString('base64'),
+            },
+          },
+        ],
+      },
+    ],
+  };
+
+  const res = await axios.post(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`,
+    body,
+    { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
+  );
+
+  const parts = res.data?.candidates?.[0]?.content?.parts || [];
+  const transcript = parts
+    .map((part) => part.text)
+    .filter(Boolean)
+    .join('')
+    .trim();
+
+  return transcript;
+}
+
+async function synthesizeSpeechWithGemini(text) {
+  const apiKey = getGeminiApiKey();
+  if (!apiKey) {
+    throw new Error('Missing GEMINI api key for TTS');
+  }
+
+  const body = {
+    contents: [
+      {
+        role: 'user',
+        parts: [{ text }],
+      },
+    ],
+    generationConfig: {
+      responseModalities: ['AUDIO'],
+      audioConfig: {
+        audioEncoding: 'OGG_OPUS',
+      },
+    },
+  };
+
+  const res = await axios.post(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-tts-preview:generateContent?key=${apiKey}`,
+    body,
+    { headers: { 'Content-Type': 'application/json' }, timeout: 30000 }
+  );
+
+  const parts = res.data?.candidates?.[0]?.content?.parts || [];
+  const audioPart = parts.find((part) => part.inlineData?.data);
+  const audioBase64 = audioPart?.inlineData?.data || '';
+  const mimeType = audioPart?.inlineData?.mimeType || 'audio/ogg';
+
+  if (!audioBase64) {
+    throw new Error('No audio data returned from TTS');
+  }
+
+  return {
+    audioBuffer: Buffer.from(audioBase64, 'base64'),
+    mimeType,
+  };
+}
+
+async function uploadAudioToWhatsApp(audioBuffer, mimeType) {
+  if (typeof FormData === 'undefined' || typeof Blob === 'undefined') {
+    throw new Error('FormData/Blob not available in this Node version');
+  }
+
+  const mediaUrl = `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/media`;
+  const formData = new FormData();
+  const audioType = mimeType || 'audio/ogg';
+
+  formData.append('messaging_product', 'whatsapp');
+  formData.append('type', audioType);
+  formData.append('file', new Blob([audioBuffer], { type: audioType }), 'reply.ogg');
+
+  const res = await fetch(mediaUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${ACCESS_TOKEN}`,
+    },
+    body: formData,
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data?.error?.message || 'Failed to upload audio to WhatsApp');
+  }
+
+  return data.id;
+}
+
+async function sendVoiceNoteFromText(to, text) {
+  const tts = await synthesizeSpeechWithGemini(text);
+  const mediaId = await uploadAudioToWhatsApp(tts.audioBuffer, tts.mimeType);
+  await sendAudioById(to, mediaId);
+  return mediaId;
 }
 
 /**
@@ -904,6 +1067,81 @@ router.post('/webhook', async (req, res) => {
   console.log(`${'█'.repeat(80)}\n`);
 });
 
+async function handleVoiceNoteConversation({ from, messageId, mediaId }) {
+  const normalizedPhone = normalizePhone(from) || from;
+
+  console.log(`  🔎 Fetching media info for voice note...`);
+  const mediaInfo = await fetchWhatsAppMediaInfo(mediaId);
+  if (!mediaInfo?.url) {
+    throw new Error('WhatsApp media URL not found');
+  }
+
+  console.log(`  ⬇️ Downloading voice note media...`);
+  const audioBuffer = await downloadWhatsAppMedia(mediaInfo.url);
+
+  console.log(`  🧠 Transcribing voice note with Gemini...`);
+  const transcript = await transcribeAudioWithGemini(
+    audioBuffer,
+    mediaInfo.mimeType || 'audio/ogg'
+  );
+
+  if (!transcript) {
+    const apology = 'Sorry, I could not understand the voice note. Please try again.';
+    await sendVoiceNoteFromText(normalizedPhone, apology);
+    return { transcript: '', mediaUrl: mediaInfo.url };
+  }
+
+  console.log(`  📝 Transcript: "${transcript.substring(0, 120)}${transcript.length > 120 ? '...' : ''}"`);
+
+  const campaign = await findLatestCampaignByPhone(normalizedPhone);
+  if (!campaign) {
+    const noCampaignText = 'Hi! I could not find an active campaign for your number. Please contact support.';
+    await sendVoiceNoteFromText(normalizedPhone, noCampaignText);
+    return { transcript, mediaUrl: mediaInfo.url };
+  }
+
+  const { userId, campaignId, contactId, contactName } = campaign;
+  console.log(`  ✅ Campaign found for voice note: ${campaignId}`);
+
+  const aiReply = await generateCampaignReply(userId, campaignId, contactId, transcript);
+
+  let replyMediaId = null;
+  let replyType = 'audio';
+
+  try {
+    replyMediaId = await sendVoiceNoteFromText(normalizedPhone, aiReply);
+  } catch (sendErr) {
+    replyType = 'text';
+    console.error(`  ❌ Voice reply failed, falling back to text:`, sendErr.message);
+    await sendText(normalizedPhone, aiReply);
+  }
+
+  await saveChatHistory(
+    userId,
+    campaignId,
+    contactId,
+    transcript,
+    aiReply,
+    normalizedPhone,
+    contactName,
+    {
+      userType: 'audio',
+      aiType: replyType,
+      userMeta: {
+        mediaId,
+        mimeType: mediaInfo.mimeType || 'audio/ogg',
+        transcript,
+        whatsappMessageId: messageId,
+      },
+      aiMeta: {
+        audioMediaId: replyMediaId,
+      },
+    }
+  );
+
+  return { transcript, mediaUrl: mediaInfo.url };
+}
+
 /**
  * Handle incoming WhatsApp message
  * Now uses the conversation handler to generate AI responses
@@ -924,6 +1162,8 @@ async function handleIncomingMessage(message, metadata) {
   try {
     let content = '';
     let mediaUrl = '';
+    let mediaId = '';
+    const isVoiceNote = type === 'audio' || type === 'voice';
 
     // Extract message content based on type
     if (type === 'text') {
@@ -931,6 +1171,7 @@ async function handleIncomingMessage(message, metadata) {
       console.log(`\n  📝 TEXT MESSAGE:`);
       console.log(`     "${content}"`);
     } else if (type === 'audio') {
+      mediaId = message.audio?.id || '';
       mediaUrl = message.audio?.link || '';
       content = 'Audio message';
       console.log(`\n  🎵 AUDIO:`);
@@ -946,6 +1187,7 @@ async function handleIncomingMessage(message, metadata) {
       console.log(`\n  📄 DOCUMENT:`);
       console.log(`     ${content}`);
     } else if (type === 'voice') {
+      mediaId = message.voice?.id || '';
       mediaUrl = message.voice?.link || '';
       content = 'Voice message';
       console.log(`\n  🎙️ VOICE:`);
@@ -957,7 +1199,6 @@ async function handleIncomingMessage(message, metadata) {
     }
 
     // Handle conversation via WhatsApp conversation handler
-    // Only process text messages for now (audio/image/etc might not make sense for AI replies)
     if (type === 'text' && content.trim()) {
       console.log(`\n  ✅ This is a TEXT MESSAGE - proceeding to conversation handler...`);
       console.log(`  🤖 Calling handleWhatsAppMessage()...`);
@@ -969,6 +1210,25 @@ async function handleIncomingMessage(message, metadata) {
       } catch (convErr) {
         console.error(`  ❌ AI Response Handler FAILED:`, convErr.message);
         console.error(convErr.stack);
+      }
+    } else if (isVoiceNote) {
+      if (!mediaId) {
+        console.warn(`\n  ⚠️ Voice note missing media id - skipping AI response generation`);
+      } else {
+        console.log(`\n  ✅ This is a VOICE NOTE - transcribing and replying with voice...`);
+        try {
+          const voiceResult = await handleVoiceNoteConversation({
+            from,
+            messageId,
+            mediaId,
+          });
+          content = voiceResult.transcript || content;
+          mediaUrl = voiceResult.mediaUrl || mediaUrl;
+          console.log(`  ✅ Voice note flow completed`);
+        } catch (voiceErr) {
+          console.error(`  ❌ Voice note flow FAILED:`, voiceErr.message);
+          console.error(voiceErr.stack);
+        }
       }
     } else {
       console.log(`\n  ℹ️ Message type '${type}' - skipping AI response generation`);

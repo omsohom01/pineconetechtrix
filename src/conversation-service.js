@@ -503,8 +503,12 @@ async function loadChatHistory(userId, campaignId, contactId) {
  *   - AI reply as sender:'campaign'
  * Also updates the contact document's lastMessage/lastMessageTime/unreadCount.
  */
-async function saveChatHistory(userId, campaignId, contactId, userMessage, aiReply, phone, contactName) {
+async function saveChatHistory(userId, campaignId, contactId, userMessage, aiReply, phone, contactName, options = {}) {
   const db = getDb();
+  const userType = options.userType || 'text';
+  const aiType = options.aiType || 'text';
+  const userMeta = options.userMeta || {};
+  const aiMeta = options.aiMeta || {};
 
   const contactRef = db
     .collection('users')
@@ -531,9 +535,10 @@ async function saveChatHistory(userId, campaignId, contactId, userMessage, aiRep
     await contactRef.collection('messages').doc(userMsgId).set({
       id: userMsgId,
       sender: 'user',
-      type: 'text',
+      type: userType,
       content: userMessage,
       contactPhone: phone,
+      meta: userMeta,
       timestamp: new Date().toISOString(),
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
@@ -543,8 +548,9 @@ async function saveChatHistory(userId, campaignId, contactId, userMessage, aiRep
     await contactRef.collection('messages').doc(aiMsgId).set({
       id: aiMsgId,
       sender: 'campaign',
-      type: 'text',
+      type: aiType,
       content: aiReply,
+      meta: aiMeta,
       timestamp: new Date().toISOString(),
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
@@ -781,5 +787,6 @@ module.exports = {
   handleWhatsAppMessage,
   findLatestCampaignByPhone,
   generateCampaignReply,
+  saveChatHistory,
   sendWhatsAppReply,
 };
