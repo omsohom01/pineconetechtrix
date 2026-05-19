@@ -337,51 +337,38 @@ async function synthesizeSpeechWithGemini(text) {
   };
 
   const ttsVoice = process.env.GEMINI_TTS_VOICE || '';
-  const speechConfig = ttsVoice
-    ? {
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: ttsVoice },
-          },
-        },
-      }
-    : {};
-
-  const primaryBody = {
+  const baseBody = {
     contents: [
       {
         role: 'user',
         parts: [{ text }],
       },
     ],
-    generationConfig: {
-      responseModalities: ['AUDIO'],
-      responseMimeType: 'audio/ogg',
-    },
-    ...speechConfig,
+    responseModalities: ['AUDIO'],
   };
 
+  const withVoiceBody = ttsVoice
+    ? {
+        ...baseBody,
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: ttsVoice },
+          },
+        },
+      }
+    : null;
+
   try {
-    return await invokeTts(primaryBody, 'primary');
+    if (withVoiceBody) {
+      return await invokeTts(withVoiceBody, 'primary');
+    }
+    return await invokeTts(baseBody, 'primary');
   } catch (err) {
     if (err?.response?.status !== 400) {
       throw err;
     }
 
-    const fallbackBody = {
-      contents: [
-        {
-          role: 'user',
-          parts: [{ text }],
-        },
-      ],
-      generationConfig: {
-        responseModalities: ['AUDIO'],
-      },
-      ...speechConfig,
-    };
-
-    return await invokeTts(fallbackBody, 'fallback');
+    return await invokeTts(baseBody, 'fallback');
   }
 }
 
