@@ -330,10 +330,22 @@ async function synthesizeSpeechWithGemini(text) {
       console.error(`[TTS] ${label} request failed`, {
         status,
         error: data?.error || data,
+        raw: data ? JSON.stringify(data, null, 2) : undefined,
       });
       throw err;
     }
   };
+
+  const ttsVoice = process.env.GEMINI_TTS_VOICE || '';
+  const speechConfig = ttsVoice
+    ? {
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: ttsVoice },
+          },
+        },
+      }
+    : {};
 
   const primaryBody = {
     contents: [
@@ -344,10 +356,9 @@ async function synthesizeSpeechWithGemini(text) {
     ],
     generationConfig: {
       responseModalities: ['AUDIO'],
-      audioConfig: {
-        audioEncoding: 'OGG_OPUS',
-      },
+      responseMimeType: 'audio/ogg',
     },
+    ...speechConfig,
   };
 
   try {
@@ -367,6 +378,7 @@ async function synthesizeSpeechWithGemini(text) {
       generationConfig: {
         responseModalities: ['AUDIO'],
       },
+      ...speechConfig,
     };
 
     return await invokeTts(fallbackBody, 'fallback');
