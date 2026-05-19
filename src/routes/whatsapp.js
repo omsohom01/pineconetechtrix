@@ -450,35 +450,35 @@ async function synthesizeSpeechWithGemini(text) {
 
   const ttsVoice = process.env.GEMINI_TTS_VOICE || '';
   const baseConfig = {
-    responseModalities: ['AUDIO'],
-  };
+  responseModalities: ['AUDIO'],
+};
 
-  const voiceConfig = ttsVoice
-    ? {
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: ttsVoice },
-          },
+const voiceConfig = ttsVoice
+  ? {
+      speechConfig: {
+        voiceConfig: {
+          prebuiltVoiceConfig: { voiceName: ttsVoice },
         },
-      }
-    : {};
-
-  const baseBody = {
-    contents: [
-      {
-        role: 'user',
-        parts: [{ text }],
       },
-    ],
-    config: baseConfig,
-  };
+    }
+  : {};
 
-  const withVoiceBody = ttsVoice
-    ? {
-        contents: baseBody.contents,
-        config: { ...baseConfig, ...voiceConfig },
-      }
-    : null;
+const baseBody = {
+  contents: [
+    {
+      role: 'user',
+      parts: [{ text }],
+    },
+  ],
+  generationConfig: baseConfig,           // ✅ CORRECT KEY
+};
+
+const withVoiceBody = ttsVoice
+  ? {
+      contents: baseBody.contents,
+      generationConfig: { ...baseConfig, ...voiceConfig },  // ✅ CORRECT KEY
+    }
+  : null;
 
   try {
     if (withVoiceBody) {
