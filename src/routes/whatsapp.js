@@ -1,6 +1,19 @@
 const express = require('express');
 const axios = require('axios');
+const fs = require('fs/promises');
+const os = require('os');
+const path = require('path');
+const { spawn } = require('child_process');
+const wav = require('wav');
+const { PassThrough } = require('stream');
 const router = express.Router();
+
+let ffmpegStaticPath = null;
+try {
+  ffmpegStaticPath = require('ffmpeg-static');
+} catch (err) {
+  ffmpegStaticPath = null;
+}
 const {
   handleWhatsAppMessage,
   findLatestCampaignByPhone,
@@ -234,6 +247,95 @@ function getGeminiApiKey() {
   return process.env.GEMINI_WHATSAPP_API_KEY || process.env.GEMINI_API_KEY || '';
 }
 
+function getFfmpegPath() {
+  return process.env.FFMPEG_PATH || ffmpegStaticPath || 'ffmpeg';
+}
+
+function runFfmpeg(args) {
+  return new Promise((resolve, reject) => {
+    const ffmpegPath = getFfmpegPath();
+    const proc = spawn(ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+
+    proc.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    proc.on('error', (err) => {
+      reject(new Error(`ffmpeg failed to start: ${err.message}`));
+    });
+
+    proc.on('close', (code) => {
+      if (code === 0) return resolve();
+      reject(new Error(`ffmpeg exited with code ${code}: ${stderr}`));
+    });
+  });
+}
+
+function isWavBuffer(buffer) {
+  if (!buffer || buffer.length < 12) return false;
+  return (
+    buffer.toString('ascii', 0, 4) === 'RIFF' &&
+    buffer.toString('ascii', 8, 12) === 'WAVE'
+  );
+}
+
+function pcmToWavBuffer(pcmBuffer, options = {}) {
+  const { channels = 1, sampleRate = 24000, bitDepth = 16 } = options;
+
+  return new Promise((resolve, reject) => {
+    const writer = new wav.Writer({
+      channels,
+      sampleRate,
+      bitDepth,
+    });
+
+    const passthrough = new PassThrough();
+    const chunks = [];
+
+    passthrough.on('data', (chunk) => chunks.push(chunk));
+    passthrough.on('end', () => resolve(Buffer.concat(chunks)));
+    passthrough.on('error', reject);
+    writer.on('error', reject);
+
+    writer.pipe(passthrough);
+    writer.write(pcmBuffer);
+    writer.end();
+  });
+}
+
+async function convertWavToOggOpus(wavBuffer) {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'wa-tts-'));
+  const inputPath = path.join(tmpDir, 'input.wav');
+  const outputPath = path.join(tmpDir, 'output.ogg');
+
+  try {
+    await fs.writeFile(inputPath, wavBuffer);
+    await runFfmpeg(['-y', '-i', inputPath, '-c:a', 'libopus', '-b:a', '24k', outputPath]);
+    return await fs.readFile(outputPath);
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+}
+
+async function ensureOggOpus(audioBuffer, mimeType) {
+  if (mimeType && mimeType.includes('ogg')) {
+    return { audioBuffer, mimeType: 'audio/ogg' };
+  }
+
+  if (mimeType && mimeType.includes('wav')) {
+    const oggBuffer = await convertWavToOggOpus(audioBuffer);
+    return { audioBuffer: oggBuffer, mimeType: 'audio/ogg' };
+  }
+
+  if (isWavBuffer(audioBuffer)) {
+    const oggBuffer = await convertWavToOggOpus(audioBuffer);
+    return { audioBuffer: oggBuffer, mimeType: 'audio/ogg' };
+  }
+
+  throw new Error('Unsupported TTS output format for WhatsApp voice note');
+}
+
 async function fetchWhatsAppMediaInfo(mediaId) {
   const url = `https://graph.facebook.com/v22.0/${mediaId}`;
   const res = await axios.get(url, {
@@ -314,14 +416,24 @@ async function synthesizeSpeechWithGemini(text) {
       const parts = res.data?.candidates?.[0]?.content?.parts || [];
       const audioPart = parts.find((part) => part.inlineData?.data);
       const audioBase64 = audioPart?.inlineData?.data || '';
-      const mimeType = audioPart?.inlineData?.mimeType || 'audio/ogg';
+      const inlineMime = audioPart?.inlineData?.mimeType || '';
 
       if (!audioBase64) {
         throw new Error('No audio data returned from TTS');
       }
 
+      let audioBuffer = Buffer.from(audioBase64, 'base64');
+      let mimeType = inlineMime;
+
+      if (!mimeType && !isWavBuffer(audioBuffer)) {
+        audioBuffer = await pcmToWavBuffer(audioBuffer);
+        mimeType = 'audio/wav';
+      } else if (!mimeType && isWavBuffer(audioBuffer)) {
+        mimeType = 'audio/wav';
+      }
+
       return {
-        audioBuffer: Buffer.from(audioBase64, 'base64'),
+        audioBuffer,
         mimeType,
       };
     } catch (err) {
@@ -337,6 +449,20 @@ async function synthesizeSpeechWithGemini(text) {
   };
 
   const ttsVoice = process.env.GEMINI_TTS_VOICE || '';
+  const baseConfig = {
+    responseModalities: ['AUDIO'],
+  };
+
+  const voiceConfig = ttsVoice
+    ? {
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: ttsVoice },
+          },
+        },
+      }
+    : {};
+
   const baseBody = {
     contents: [
       {
@@ -344,17 +470,13 @@ async function synthesizeSpeechWithGemini(text) {
         parts: [{ text }],
       },
     ],
-    responseModalities: ['AUDIO'],
+    config: baseConfig,
   };
 
   const withVoiceBody = ttsVoice
     ? {
-        ...baseBody,
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: ttsVoice },
-          },
-        },
+        contents: baseBody.contents,
+        config: { ...baseConfig, ...voiceConfig },
       }
     : null;
 
@@ -403,7 +525,8 @@ async function uploadAudioToWhatsApp(audioBuffer, mimeType) {
 
 async function sendVoiceNoteFromText(to, text) {
   const tts = await synthesizeSpeechWithGemini(text);
-  const mediaId = await uploadAudioToWhatsApp(tts.audioBuffer, tts.mimeType);
+  const oggAudio = await ensureOggOpus(tts.audioBuffer, tts.mimeType);
+  const mediaId = await uploadAudioToWhatsApp(oggAudio.audioBuffer, oggAudio.mimeType);
   await sendAudioById(to, mediaId);
   return mediaId;
 }
