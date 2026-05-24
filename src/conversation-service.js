@@ -353,6 +353,47 @@ async function getChunkTextFromFirestore(userId, campaignId, fileName, chunkInde
   return '';
 }
 
+// ── Fetch Q&A pairs from Firestore qna subcollection ───────────────────────
+/**
+ * Loads all question-answer pairs stored under:
+ *   users/{userId}/campaigns/{campaignId}/qna/{docId}
+ * Each document is expected to have at least { question, answer } fields.
+ * Returns a formatted string ready to be injected into the prompt, or '' if empty.
+ */
+async function fetchQnaFromFirestore(userId, campaignId) {
+  const db = getDb();
+  try {
+    const qnaSnap = await db
+      .collection('users')
+      .doc(userId)
+      .collection('campaigns')
+      .doc(campaignId)
+      .collection('qna')
+      .get();
+
+    if (qnaSnap.empty) {
+      console.log(`[Conv-Service]    🔴 QnA collection is empty for campaign ${campaignId}`);
+      return '';
+    }
+
+    const pairs = [];
+    qnaSnap.docs.forEach((doc) => {
+      const d = doc.data();
+      const q = d.question || d.q || '';
+      const a = d.answer   || d.a || '';
+      if (q && a) {
+        pairs.push(`Q: ${q}\nA: ${a}`);
+      }
+    });
+
+    console.log(`[Conv-Service]    ✅ QnA: loaded ${pairs.length} pairs from Firestore`);
+    return pairs.join('\n\n');
+  } catch (error) {
+    console.warn(`[Conv-Service]    ⚠️ fetchQnaFromFirestore failed:`, error.message);
+    return '';
+  }
+}
+
 async function retrieveRagContext(userId, campaignId, question) {
   const namespace = await loadPineconeNamespace(userId, campaignId);
   const index = getPineconeIndex();
@@ -604,17 +645,24 @@ async function generateCampaignReply(userId, campaignId, contactId, message) {
     console.log(`[Conv-Service]    🤖 Generating AI reply (CAMPAIGN-CONTEXT)...`);
     console.log(`[Conv-Service]       User: ${userId}, Campaign: ${campaignId}, Contact: ${contactId}`);
 
+    // Load static context + chat history first (fast)
     const context = await loadCampaignContext(userId, campaignId);
     const { title } = context;
-    
     console.log(`[Conv-Service]       Context loaded: title=${title.length > 0 ? '✓' : '✗'}`);
 
     const history = await loadChatHistory(userId, campaignId, contactId);
     console.log(`[Conv-Service]       History: ${history.length} exchanges`);
 
-    const rag = await retrieveRagContext(userId, campaignId, message);
-    console.log(`[Conv-Service]       RAG context: ${rag.context.length} chars, matches=${rag.matchCount}`);
-    
+    // Fetch RAG (Pinecone) + QnA (Firestore) in PARALLEL for speed
+    console.log(`[Conv-Service]       🔄 Fetching RAG context + QnA pairs in parallel...`);
+    const [rag, qnaContext] = await Promise.all([
+      retrieveRagContext(userId, campaignId, message),
+      fetchQnaFromFirestore(userId, campaignId),
+    ]);
+
+    console.log(`[Conv-Service]       RAG context : ${rag.context.length} chars, matches=${rag.matchCount}`);
+    console.log(`[Conv-Service]       QnA context : ${qnaContext.length} chars`);
+
     // Display chunk sources in detail
     if (rag.chunkDetails && rag.chunkDetails.length > 0) {
       console.log(`[Conv-Service]       📦 CHUNK SOURCES:\n`);
@@ -625,34 +673,47 @@ async function generateCampaignReply(userId, campaignId, contactId, message) {
       });
     }
 
-    if (!rag.context) {
+    // Need at least one knowledge source to proceed
+    if (!rag.context && !qnaContext) {
       return 'Sorry, I do not have information related to that.';
     }
+
+    // Build knowledge blocks — only include non-empty ones
+    const ragBlock = rag.context
+      ? `=== DOCUMENT KNOWLEDGE (retrieved from campaign files) ===\n${rag.context}\n=== END DOCUMENT KNOWLEDGE ===`
+      : '';
+
+    const qnaBlock = qnaContext
+      ? `=== Q&A KNOWLEDGE (curated question-answer pairs) ===\n${qnaContext}\n=== END Q&A KNOWLEDGE ===`
+      : '';
+
+    const knowledgeSection = [ragBlock, qnaBlock].filter(Boolean).join('\n\n');
 
     // 🔥 CRITICAL: Strong prompt that forces context-based answers
     const prompt = `You are a helpful, sales-oriented assistant for the "${title}" campaign.
 
-  === CONTEXT (Your ONLY source of information) ===
-  ${rag.context}
-  === END CONTEXT ===
+You have two knowledge sources below. Use BOTH to answer the user's question.
+Prioritise the Document Knowledge for detailed explanations, and the Q&A Knowledge for direct frequently-asked questions.
 
-  CRITICAL RULES:
-  1. Answer using ONLY the information inside the context block
-  2. Do NOT mention internal sources, "campaign context", or say "based on the context"
-  3. If the answer is not in the context, say you don't have that detail and ask one short follow-up
-  4. Keep the tone warm, confident, and concise
+${knowledgeSection}
 
-  Recent conversation history:
-  ${history.length > 0 ? history.map((h) => `Q: ${h.input}\nA: ${h.output}`).join('\n\n') : 'No previous conversation'}
+CRITICAL RULES:
+1. Answer using ONLY information from the knowledge blocks above
+2. Do NOT mention internal sources, "campaign context", or say "based on the context"
+3. If the answer is not found in either knowledge source, say you don't have that detail and ask one short follow-up
+4. Keep the tone warm, confident, and concise
 
-  User question: "${message}"
+Recent conversation history:
+${history.length > 0 ? history.map((h) => `Q: ${h.input}\nA: ${h.output}`).join('\n\n') : 'No previous conversation'}
 
-  RESPOND NOW - Use the context details to answer clearly.`;
+User question: "${message}"
+
+RESPOND NOW - Use the knowledge above to answer clearly.`;
 
     const model = getModel();
     console.log(`[Conv-Service]       📝 Prompt length: ${prompt.length} chars`);
     console.log(`[Conv-Service]       🔄 Calling Gemini API (CONTEXT-BASED)...`);
-    
+
     const result = await model.invoke(prompt);
     const aiReply = result.content?.toString().trim() || 'I\'m here to help with questions about this campaign.';
 
