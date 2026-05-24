@@ -647,8 +647,10 @@ async function generateCampaignReply(userId, campaignId, contactId, message) {
 
     // Load static context + chat history first (fast)
     const context = await loadCampaignContext(userId, campaignId);
-    const { title } = context;
-    console.log(`[Conv-Service]       Context loaded: title=${title.length > 0 ? '✓' : '✗'}`);
+    // ⚠️  Destructure BOTH title AND documents — the documents string already contains
+    //     any Q&A pairs the user embedded in their uploaded files.
+    const { title, documents: campaignDocuments } = context;
+    console.log(`[Conv-Service]       Context loaded: title=${title.length > 0 ? '✓' : '✗'}, docs=${campaignDocuments?.length ?? 0} chars`);
 
     const history = await loadChatHistory(userId, campaignId, contactId);
     console.log(`[Conv-Service]       History: ${history.length} exchanges`);
@@ -674,34 +676,54 @@ async function generateCampaignReply(userId, campaignId, contactId, message) {
     }
 
     // Need at least one knowledge source to proceed
-    if (!rag.context && !qnaContext) {
+    if (!rag.context && !qnaContext && !campaignDocuments) {
       return 'Sorry, I do not have information related to that.';
     }
 
-    // Build knowledge blocks — only include non-empty ones
+    // ── Build knowledge blocks (only include non-empty ones) ─────────────────
+    //
+    //  1. CAMPAIGN DOCUMENTS — the full extracted text from uploaded files.
+    //     This is the MOST RELIABLE source because it bypasses Pinecone entirely.
+    //     It already contains any Q&A pairs the user typed into their documents.
+    //
+    //  2. RAG SNIPPETS — semantically retrieved chunks from Pinecone.
+    //     Useful for large corpora; may be empty if chunk retrieval from
+    //     Firestore failed (known issue when chunk field names mismatch).
+    //
+    //  3. DEDICATED Q&A PAIRS — from the campaign's /qna Firestore subcollection
+    //     (if the user stores them separately).
+
+    const docsBlock = campaignDocuments
+      ? `=== CAMPAIGN DOCUMENTS (complete extracted text, includes any Q&A pairs) ===\n${campaignDocuments}\n=== END CAMPAIGN DOCUMENTS ===`
+      : '';
+
     const ragBlock = rag.context
-      ? `=== DOCUMENT KNOWLEDGE (retrieved from campaign files) ===\n${rag.context}\n=== END DOCUMENT KNOWLEDGE ===`
+      ? `=== ADDITIONAL RAG SNIPPETS (semantically matched chunks) ===\n${rag.context}\n=== END RAG SNIPPETS ===`
       : '';
 
     const qnaBlock = qnaContext
-      ? `=== Q&A KNOWLEDGE (curated question-answer pairs) ===\n${qnaContext}\n=== END Q&A KNOWLEDGE ===`
+      ? `=== DEDICATED Q&A PAIRS ===\n${qnaContext}\n=== END DEDICATED Q&A PAIRS ===`
       : '';
 
-    const knowledgeSection = [ragBlock, qnaBlock].filter(Boolean).join('\n\n');
+    const knowledgeSection = [docsBlock, ragBlock, qnaBlock].filter(Boolean).join('\n\n');
+
+    console.log(`[Conv-Service]       📚 Knowledge blocks: docs=${docsBlock.length}, rag=${ragBlock.length}, qna=${qnaBlock.length} chars`);
 
     // 🔥 CRITICAL: Strong prompt that forces context-based answers
     const prompt = `You are a helpful, sales-oriented assistant for the "${title}" campaign.
 
-You have two knowledge sources below. Use BOTH to answer the user's question.
-Prioritise the Document Knowledge for detailed explanations, and the Q&A Knowledge for direct frequently-asked questions.
+Below are your knowledge sources. Use ALL of them to answer the user's question.
+The CAMPAIGN DOCUMENTS are your primary reference — they contain the full event/product details and any Q&A pairs embedded in the documents.
+Use RAG SNIPPETS and Q&A PAIRS as additional confirmation.
 
 ${knowledgeSection}
 
 CRITICAL RULES:
 1. Answer using ONLY information from the knowledge blocks above
-2. Do NOT mention internal sources, "campaign context", or say "based on the context"
-3. If the answer is not found in either knowledge source, say you don't have that detail and ask one short follow-up
-4. Keep the tone warm, confident, and concise
+2. Do NOT say "based on the context", "based on the documents", or reveal internal source names
+3. If the answer exists ANYWHERE in the knowledge blocks, use it — do NOT say you don't have information
+4. If the answer truly cannot be found in any knowledge block, say you don't have that detail and ask one short follow-up
+5. Keep the tone warm, confident, and concise
 
 Recent conversation history:
 ${history.length > 0 ? history.map((h) => `Q: ${h.input}\nA: ${h.output}`).join('\n\n') : 'No previous conversation'}
