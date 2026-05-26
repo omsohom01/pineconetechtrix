@@ -899,6 +899,11 @@ router.post('/send-call-details', async (req, res) => {
   if (!phone) return res.status(400).json({ error: 'Valid phone required' });
   if (!requestText) return res.status(400).json({ error: 'requestText is required' });
 
+  console.log(`\n📞 [CALL→WA] Request received`);
+  console.log(`   Call ID: ${callId || 'unknown'}`);
+  console.log(`   Phone: ${phone}`);
+  console.log(`   Request: "${requestText}"`);
+
   let resolvedUserId = userId;
   let resolvedCampaignId = campaignId;
   let contactId = null;
@@ -920,6 +925,9 @@ router.post('/send-call-details', async (req, res) => {
     resolvedCampaignId = latestCampaign.campaignId;
   }
 
+  console.log(`   Resolved userId: ${resolvedUserId}`);
+  console.log(`   Resolved campaignId: ${resolvedCampaignId}`);
+
   if (latestCampaign &&
       latestCampaign.userId === resolvedUserId &&
       latestCampaign.campaignId === resolvedCampaignId) {
@@ -936,6 +944,8 @@ router.post('/send-call-details', async (req, res) => {
       contactId,
       requestText
     );
+
+    console.log(`   AI reply preview: "${aiReply.substring(0, 180)}${aiReply.length > 180 ? '...' : ''}"`);
 
     // Save call-originated request to chat history for traceability
     await saveChatHistory(
@@ -956,6 +966,8 @@ router.post('/send-call-details', async (req, res) => {
 
     const sendResult = await sendText(phone, aiReply);
     const msgId = sendResult?.messages?.[0]?.id;
+
+    console.log(`✅ [CALL→WA] Message sent — ID: ${msgId || 'unknown'}`);
 
     return res.json({ success: true, messageId: msgId, reply: aiReply });
   } catch (err) {
