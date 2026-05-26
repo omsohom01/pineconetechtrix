@@ -877,6 +877,95 @@ router.post('/send-message', async (req, res) => {
 });
 
 /**
+ * POST /api/whatsapp/send-call-details
+ *
+ * Triggered during a phone call when the user asks to receive details on WhatsApp.
+ * Generates a concise response from the campaign knowledge base and sends it only
+ * to the caller's WhatsApp number.
+ *
+ * Body:
+ * {
+ *   phone: string,
+ *   requestText: string,
+ *   userId?: string,
+ *   campaignId?: string,
+ *   callId?: string
+ * }
+ */
+router.post('/send-call-details', async (req, res) => {
+  const { phone: rawPhone, requestText, userId, campaignId, callId } = req.body;
+
+  const phone = normalizePhone(rawPhone);
+  if (!phone) return res.status(400).json({ error: 'Valid phone required' });
+  if (!requestText) return res.status(400).json({ error: 'requestText is required' });
+
+  let resolvedUserId = userId;
+  let resolvedCampaignId = campaignId;
+  let contactId = null;
+  let contactName = 'Unknown Contact';
+
+  // Try to resolve contact info from the latest campaign for this phone
+  let latestCampaign = null;
+  try {
+    latestCampaign = await findLatestCampaignByPhone(phone);
+  } catch (err) {
+    console.warn(`[WhatsApp-Route] ⚠️ Failed to resolve latest campaign:`, err.message);
+  }
+
+  if (!resolvedUserId || !resolvedCampaignId) {
+    if (!latestCampaign) {
+      return res.status(404).json({ error: 'No campaign found for this phone number' });
+    }
+    resolvedUserId = latestCampaign.userId;
+    resolvedCampaignId = latestCampaign.campaignId;
+  }
+
+  if (latestCampaign &&
+      latestCampaign.userId === resolvedUserId &&
+      latestCampaign.campaignId === resolvedCampaignId) {
+    contactId = latestCampaign.contactId;
+    contactName = latestCampaign.contactName || contactName;
+  } else {
+    contactId = `contact_${phone}_${resolvedCampaignId}`;
+  }
+
+  try {
+    const aiReply = await generateCampaignReply(
+      resolvedUserId,
+      resolvedCampaignId,
+      contactId,
+      requestText
+    );
+
+    // Save call-originated request to chat history for traceability
+    await saveChatHistory(
+      resolvedUserId,
+      resolvedCampaignId,
+      contactId,
+      requestText,
+      aiReply,
+      phone,
+      contactName,
+      {
+        userType: 'call',
+        aiType: 'text',
+        userMeta: { source: 'call', callId: callId || null },
+        aiMeta: { source: 'whatsapp', callId: callId || null },
+      }
+    );
+
+    const sendResult = await sendText(phone, aiReply);
+    const msgId = sendResult?.messages?.[0]?.id;
+
+    return res.json({ success: true, messageId: msgId, reply: aiReply });
+  } catch (err) {
+    const errMsg = err?.response?.data?.error?.message || err.message;
+    console.error(`[WhatsApp-Route] ❌ send-call-details failed:`, errMsg);
+    return res.status(500).json({ error: errMsg });
+  }
+});
+
+/**
  * POST /api/whatsapp/send-reply
  *
  * Send an AI-generated reply text to a contact.
