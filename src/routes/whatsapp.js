@@ -16,6 +16,14 @@ const {
   generateCampaignReply,
   saveChatHistory,
 } = require('../conversation-service');
+const {
+  BUTTON_STOP,
+  BUTTON_CONTINUE,
+  isCampaignOptedOut,
+  wasPreferencePromptSent,
+  setCampaignOptOut,
+  markPreferencePromptSent,
+} = require('../campaign-opt-out-service');
 
 const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
 const ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
@@ -109,6 +117,39 @@ async function sendText(to, text) {
     to,
     type: 'text',
     text: { body: text, preview_url: false },
+  });
+}
+
+/**
+ * Send interactive buttons asking whether to stop campaign updates.
+ */
+async function sendCampaignPreferencePrompt(to, campaignTitle = 'this campaign') {
+  const bodyText =
+    `Do you want to stop getting more information about "${campaignTitle}"?\n\n` +
+    'Tap *Yes, stop* to opt out of future messages for this campaign.\n' +
+    'Tap *No, continue* or ignore this message to keep receiving updates.';
+
+  return sendWA({
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to,
+    type: 'interactive',
+    interactive: {
+      type: 'button',
+      body: { text: bodyText },
+      action: {
+        buttons: [
+          {
+            type: 'reply',
+            reply: { id: BUTTON_STOP, title: 'Yes, stop' },
+          },
+          {
+            type: 'reply',
+            reply: { id: BUTTON_CONTINUE, title: 'No, continue' },
+          },
+        ],
+      },
+    },
   });
 }
 
@@ -583,7 +624,7 @@ async function updateAnalysisForWhatsApp(userId, campaignId, contactData) {
  * }
  */
 router.post('/send-campaign', async (req, res) => {
-  const { contacts, title, description, audioUrl, assets } = req.body;
+  const { contacts, title, description, audioUrl, assets, userId, campaignId } = req.body;
 
   if (!contacts || !Array.isArray(contacts) || contacts.length === 0) {
     return res.status(400).json({ error: 'contacts array is required' });
@@ -591,6 +632,7 @@ router.post('/send-campaign', async (req, res) => {
 
   console.log(`\n📣 Sending WhatsApp campaign to ${contacts.length} contacts`);
   console.log(`   Title:      ${title}`);
+  console.log(`   Campaign:   ${campaignId || 'N/A'}`);
   console.log(`   Audio URL:  ${audioUrl || 'NONE - NO VOICE WILL BE SENT'}`);
   console.log(`   Assets:     ${(assets || []).length} file(s)\n`);
 
@@ -606,6 +648,25 @@ router.post('/send-campaign', async (req, res) => {
     }
 
     const contactResult = { name: contact.name, phone, messages: [] };
+
+    if (userId && campaignId) {
+      try {
+        const optedOut = await isCampaignOptedOut(phone, userId, campaignId);
+        if (optedOut) {
+          console.log(`⏭️  Skipping ${contact.name} (${phone}) — opted out of campaign ${campaignId}`);
+          results.push({
+            name: contact.name,
+            phone,
+            status: 'skipped',
+            reason: 'opted_out',
+            messages: [],
+          });
+          continue;
+        }
+      } catch (optErr) {
+        console.warn(`⚠️  Opt-out check failed for ${phone}:`, optErr.message);
+      }
+    }
 
     try {
       // 1. Send campaign title as text message
@@ -777,6 +838,25 @@ router.post('/send-campaign', async (req, res) => {
               console.warn(`  ⚠️ Failed to track asset message:`, trackErr.message);
             }
           }
+        }
+      }
+
+      // 5. Ask once per campaign if they want to stop future updates
+      if (userId && campaignId) {
+        try {
+          const alreadyAsked = await wasPreferencePromptSent(phone, userId, campaignId);
+          if (!alreadyAsked) {
+            console.log(`📤 Sending campaign preference prompt to ${contact.name}...`);
+            const prefRes = await sendCampaignPreferencePrompt(phone, title || 'this campaign');
+            const prefMsgId = prefRes?.messages?.[0]?.id;
+            contactResult.messages.push({ type: 'interactive', id: prefMsgId, content: 'preference_prompt' });
+            await markPreferencePromptSent(phone, userId, campaignId);
+            console.log(`✅ [${contact.name}] Preference prompt sent`);
+          } else {
+            console.log(`ℹ️  [${contact.name}] Preference prompt already sent for this campaign`);
+          }
+        } catch (prefErr) {
+          console.warn(`⚠️  Failed to send preference prompt to ${contact.name}:`, prefErr.message);
         }
       }
 
@@ -1368,6 +1448,60 @@ async function handleVoiceNoteConversation({ from, messageId, mediaId }) {
 }
 
 /**
+ * Handle campaign preference button taps (stop / continue updates).
+ */
+async function handleCampaignPreferenceReply(from, buttonId, messageId) {
+  const normalizedPhone = normalizePhone(from) || from;
+
+  if (buttonId !== BUTTON_STOP && buttonId !== BUTTON_CONTINUE) {
+    return false;
+  }
+
+  console.log(`\n  📋 Campaign preference reply: ${buttonId} from ${normalizedPhone}`);
+
+  const campaign = await findLatestCampaignByPhone(normalizedPhone);
+  if (!campaign) {
+    await sendText(
+      normalizedPhone,
+      'Thanks for your response. We could not find a campaign linked to your number.'
+    );
+    return true;
+  }
+
+  const { userId, campaignId, contactId } = campaign;
+  const optedOut = buttonId === BUTTON_STOP;
+
+  await setCampaignOptOut(normalizedPhone, userId, campaignId, contactId, optedOut);
+
+  const confirmation = optedOut
+    ? 'You will no longer receive WhatsApp updates for this campaign, even if it is relaunched. You can still message us here if you have questions.'
+    : 'Got it! You will continue receiving information about this campaign when it is relaunched.';
+
+  await sendText(normalizedPhone, confirmation);
+
+  try {
+    await saveChatHistory(
+      userId,
+      campaignId,
+      contactId,
+      optedOut ? 'Yes, stop campaign updates' : 'No, continue campaign updates',
+      confirmation,
+      normalizedPhone,
+      campaign.contactName,
+      {
+        userType: 'interactive',
+        userMeta: { buttonId, whatsappMessageId: messageId, preference: optedOut ? 'stop' : 'continue' },
+      }
+    );
+  } catch (saveErr) {
+    console.warn(`  ⚠️ Failed to save preference to chat history:`, saveErr.message);
+  }
+
+  console.log(`  ✅ Preference saved: ${optedOut ? 'opted_out' : 'continue'}`);
+  return true;
+}
+
+/**
  * Handle incoming WhatsApp message
  * Now uses the conversation handler to generate AI responses
  */
@@ -1389,6 +1523,19 @@ async function handleIncomingMessage(message, metadata) {
     let mediaUrl = '';
     let mediaId = '';
     const isVoiceNote = type === 'audio' || type === 'voice';
+
+    // Campaign preference buttons (stop / continue updates)
+    if (type === 'interactive' && message.interactive?.type === 'button_reply') {
+      const buttonId = message.interactive.button_reply?.id || '';
+      const buttonTitle = message.interactive.button_reply?.title || '';
+      content = buttonTitle || `[Button: ${buttonId}]`;
+      console.log(`\n  🔘 INTERACTIVE BUTTON: id="${buttonId}", title="${buttonTitle}"`);
+
+      const handled = await handleCampaignPreferenceReply(from, buttonId, messageId);
+      if (handled) {
+        return;
+      }
+    }
 
     // Extract message content based on type
     if (type === 'text') {
